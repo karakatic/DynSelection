@@ -9,9 +9,12 @@ Class to perform feature selection with evolutionary and nature inspired algorit
 import logging
 import sys
 import time
+import time
 from multiprocessing import Pool
 
+import EvoSettings as es
 import numpy as np
+from DynSelectionBenchmark import DynSelectionBenchmark
 from NiaPy.algorithms.basic.ga import GeneticAlgorithm
 from NiaPy.task import StoppingTask, OptimizationType
 from scipy import stats
@@ -21,9 +24,6 @@ from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.naive_bayes import GaussianNB
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted
-
-import EvoPreprocess.utils.EvoSettings as es
-from DynSelectionBenchmark import DynSelectionBenchmark
 
 logging.basicConfig()
 logger = logging.getLogger('examples')
@@ -73,9 +73,10 @@ class DynFeatureSelection(_BaseFilter):
                  benchmark=DynSelectionBenchmark,
                  n_jobs=None,
                  optimizer_settings={},
-                 nFESs=(512, 256, 128, 64, 32, 16, 8),
+                 nGENs=(512, 256, 128, 64, 32, 16, 8),
                  continue_opt=False,
-                 cut_type='diff'):
+                 cut_type='diff',
+                 cutting_perc=0.1):
         super(DynFeatureSelection, self).__init__(self.select)
 
         self.evaluator = GaussianNB() if evaluator is None else evaluator
@@ -87,9 +88,12 @@ class DynFeatureSelection(_BaseFilter):
         self.n_jobs = n_jobs
         self.benchmark = benchmark
         self.optimizer_settings = optimizer_settings
-        self.continue_opt = continue_opt
-        self.nFESs = nFESs
-        self.cut_type = cut_type
+
+        # DynFS specific settings
+        self.continue_opt = continue_opt  # If optimization continues after cutting the genotype
+        self.nGENs = nGENs  # List (or tuple) of nGEN before cutting the genotype
+        self.cut_type = cut_type  # How to choose which genes to cut
+        self.cutting_perc = cutting_perc  # How many genes to cut after every interval (from nGENs)
 
     def _get_support_mask(self):
         check_is_fitted(self, 'scores_')
@@ -124,7 +128,8 @@ class DynFeatureSelection(_BaseFilter):
             for j in range(self.n_runs):
                 evos.append(
                     (X, y, train_index, val_index, self.random_seed + j + 1, self.optimizer, self.evaluator,
-                     self.benchmark, self.optimizer_settings, self.nFESs, self.continue_opt, self.cut_type))
+                     self.benchmark, self.optimizer_settings, self.nGENs, self.continue_opt, self.cut_type,
+                     self.cutting_perc, j))
 
         with Pool(processes=self.n_jobs) as pool:
             results = pool.starmap(DynFeatureSelection._run, evos)
@@ -132,49 +137,69 @@ class DynFeatureSelection(_BaseFilter):
         return DynFeatureSelection._reduce(results, self.n_runs, self.n_folds, self.benchmark, X.shape[1])
 
     @staticmethod
-    def _run(X, y, train_index, val_index, random_seed, optimizer, evaluator, benchmark, optimizer_settings, nFESs,
-             continue_opt, cut_type):
+    def _run(X, y, train_index, val_index, random_seed, optimizer, evaluator, benchmark, optimizer_settings, nGENs,
+             continue_opt, cut_type, cutting_perc, j):
         opt_settings = es.get_args(optimizer)
         opt_settings.update(optimizer_settings)
         X1 = X
-        cuted = []
+        cuted = []  # Which genes (features) are cutted
+        fitnesses = []   # Fitness values after every cutting
         xb, fxb, benchm = None, -1, None
         pop, fpop = None, None
-        for nFESp in nFESs:
+        for nGENp in nGENs:  # Every interval before cutting
             benchm = benchmark(X=X1, y=y,
                                train_indices=train_index, valid_indices=val_index,
                                random_seed=random_seed,
                                evaluator=evaluator)
             task = StoppingTask(D=X1.shape[1],
-                                nFES=nFESp,
+                                nGEN=nGENp,
                                 optType=OptimizationType.MINIMIZATION,
                                 benchmark=benchm)
 
             evo = optimizer(seed=random_seed, **opt_settings)
-            if continue_opt:
-                pop, fpop, xb, fxb = DynFeatureSelection.runTask(evo, task, starting_pop=pop, starting_fpop=fpop)
-            else:
-                pop, fpop, xb, fxb = DynFeatureSelection.runTask(evo, task)
+
+            # Start new optimization. Continue on pop and give fitness of pop.
+            pop, fpop, xb, fxb = DynFeatureSelection.runTask(evo, task, starting_pop=pop, starting_fpop=fpop)
 
             if not isinstance(xb, np.ndarray):
                 xb = xb.x
             xb = np.copy(xb)
-            if cut_type == 'diff':
-                idx = DynFeatureSelection.cut_n_vote_diff(pop, fpop, 0.1, benchm, n=25)
-            elif cut_type == 'vote_all':
-                idx = DynFeatureSelection.cut_all_vote_for_worst(pop, fpop, 0.1, benchm)
-            elif cut_type == 'best_vote_worst':
-                idx = DynFeatureSelection.cut_n_vote(pop, fpop, 0.1, benchm, n=50)
-            elif cut_type == 'worst_vote_best':
-                idx = DynFeatureSelection.cut_n_vote(pop, fpop, 0.1, benchm, n=-50)
-            cuted.append(idx)
-            X1 = np.delete(X1, idx, axis=1)
-            if continue_opt:
-                for ind in pop:
-                    ind.x = np.delete(ind.x, idx)
 
+            # Cut genotype. Four different strategies
+            if cut_type == 'diff':
+                # Best solutions say which features are most common, and worst solutions vote which features are most common.
+                # Difference between votes say which features will be cutted - those that are more coomon in worst solutions and
+                # least common in best features.
+                idx = DynFeatureSelection.cut_n_vote_diff(pop, fpop, cutting_perc, benchm, n=25)
+            elif cut_type == 'vote_all':
+                # Every solution votes which features are most common. Similar than best_vote worst, but every solution votes.
+                idx = DynFeatureSelection.cut_all_vote_for_worst(pop, fpop, cutting_perc, benchm)
+            elif cut_type == 'best_vote_worst':
+                # Best solutions say which features are most common. Least common features are cutted.
+                idx = DynFeatureSelection.cut_n_vote(pop, fpop, cutting_perc, benchm, n=50)
+            elif cut_type == 'worst_vote_best':
+                # Worst solutions say which features are most common. Most common features are cutted.
+                idx = DynFeatureSelection.cut_n_vote(pop, fpop, cutting_perc, benchm, n=-50)
+            cuted.append(idx)  # Log which genes are cutted
+            fitnesses.append(fxb)  # Log fitenss value after the cutting
+
+            X1 = np.delete(X1, idx, axis=1)  # Delete columns (feature) from genotypes
+
+            # If we want the optimization to continue on genes not cutted
+            if continue_opt:
+                if isinstance(pop[0], np.ndarray):  # If population is in shape of ndarray
+                    pop = np.delete(pop, idx, 1)
+                else:  # If population is in shape of individuals
+                    for ind in pop:
+                        ind.x = np.delete(ind.x, idx)
+            else:  # If we want that after cutting, the solutions are reseted (random reinitialization)
+                pop = None
+                fpop = None
+
+        # Transform solutions to datasets with selected features
         xb = benchmark.to_phenotype(xb, benchm.split)
 
+        # Remove not selected features
         for i in range(len(cuted) - 2, -1, -1):
             cut = np.sort(cuted[i])
             for c in cut:
@@ -199,20 +224,26 @@ class DynFeatureSelection(_BaseFilter):
             i = i + 1
 
         features = stats.mode(features, axis=1, nan_policy='omit')[0].flatten()
+        if np.sum(features) == 0:
+            features[0] = 1
 
         return features
 
     @staticmethod
     def runTask(nia, task, starting_pop=None, starting_fpop=None):
-        pop, fpop, dparams = nia.initPopulation(task)
         if starting_pop is not None:
+            # IF we give starting population, we want to optimization to continue on given population
             pop = starting_pop
             fpop = starting_fpop
+            _, _, dparams = nia.initPopulation(task)
+        else:
+            # If we do not give starting_pop, make new random population
+            pop, fpop, dparams = nia.initPopulation(task)
 
         xb, fxb = nia.getBest(pop, fpop)
 
         while not task.stopCond():
-            pop, fpop, dparams = nia.runIteration(task, pop, fpop, xb, fxb, **dparams)
+            pop, fpop, xb, fxb, dparams = nia.runIteration(task, pop, fpop, xb, fxb, **dparams)
             task.nextIter()
             xb1, fxb1 = nia.getBest(pop, fpop)
             if fxb1 < fxb:
@@ -225,9 +256,12 @@ class DynFeatureSelection(_BaseFilter):
         pop_b, fpop = DynFeatureSelection.get_population(pop, fpop, benchm)
 
         feature_fitnesses = np.matmul(fpop.reshape(1, -1), pop_b)
-        k = int(pop.shape[0] * perc)
+        k = int(len(feature_fitnesses[0]) * perc)
         fitness_reversed = np.amax(feature_fitnesses) - feature_fitnesses
-        idx = np.argpartition(fitness_reversed, range(k))[:, :k]
+        try:
+            idx = np.argpartition(fitness_reversed, range(k))[:, :k]
+        except:
+            print('Napaka')
 
         return idx[0]
 
@@ -240,10 +274,10 @@ class DynFeatureSelection(_BaseFilter):
         if n >= 0:  # n best
             fpop_sorted_idx = np.argsort(fpop)[:n]
         else:  # n worst
-            fpop_sorted_idx = np.argsort(fpop)[n:]
+            fpop_sorted_idx = np.argsort(fpop)[len(fpop)-n:]
 
         feature_fitnesses = np.sum(pop_b[fpop_sorted_idx], axis=0)
-        k = int(pop.shape[0] * perc)
+        k = int(len(feature_fitnesses) * perc)
 
         if n < 0:  # get worst features
             feature_fitnesses = np.amax(feature_fitnesses) - feature_fitnesses
@@ -258,15 +292,23 @@ class DynFeatureSelection(_BaseFilter):
         # n best
         fpop_best_idx = np.argsort(fpop)[:n]
         # n worst
-        fpop_worst_idx = np.argsort(fpop)[n:]
+        fpop_worst_idx = np.argsort(fpop)[len(fpop)-n:]
 
         feature_fitnesses_best = np.sum(pop_b[fpop_best_idx], axis=0)  # Which features are common in best
         feature_fitnesses_worst = np.sum(pop_b[fpop_worst_idx], axis=0)  # Which features are common in worst
 
         feature_fitnesses = feature_fitnesses_best - feature_fitnesses_worst  # Diff between common in best and worst
         # The lowest numbers will be the ones, which are not common in best, but are common in worst
-        k = int(pop.shape[0] * perc)
-        idx = np.argpartition(feature_fitnesses, range(k))[:k]
+        k = int(len(feature_fitnesses) * perc)
+        try:
+            idx = np.argpartition(feature_fitnesses, range(k))[:k]
+        except:
+            idx = np.argpartition(feature_fitnesses, range(len(feature_fitnesses)))
+
+        if len(idx) == 0:
+            print('nestima')
+        #elif len(idx) == pop.shape[1]:
+        #    print('nestima1')
 
         return idx
 
